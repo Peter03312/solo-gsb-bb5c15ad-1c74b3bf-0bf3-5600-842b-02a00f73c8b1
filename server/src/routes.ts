@@ -3,6 +3,11 @@ import { withTx, query } from './db';
 import { buildView } from './collation';
 import { buildEditionDiff } from './diff';
 import { validateGroups } from './validate';
+import {
+  computePreview,
+  loadSupplementData,
+  recheckSelections,
+} from './supplement';
 import { charLen, HttpError, isInt, sliceCp } from './util';
 import {
   bumpVersion,
@@ -12,7 +17,7 @@ import {
   loadMss,
   lockDoc,
 } from './repo';
-import { FragmentDTO, GroupDTO } from './types';
+import { FragmentDTO, GroupDTO, SupplementSelectionDTO } from './types';
 
 export const router = Router();
 
@@ -375,6 +380,159 @@ router.delete(
       await bumpVersion(c, id);
     });
     res.json({ ok: true });
+  })
+);
+
+// ---------- 补配（按底本文字在目标抄本空闲区间预配片段） ----------
+
+/**
+ * 补配预览（只读，不推进版本）：
+ * GET /api/documents/:id/supplement/preview?targetMsId=...
+ * 仅考虑目标抄本尚无片段且未标缺文的完好组；待修复组不参与。
+ */
+router.get(
+  '/documents/:id/supplement/preview',
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const targetMsId = Number(req.query.targetMsId);
+    if (!isInt(targetMsId) || targetMsId <= 0) throw new HttpError(400, '需要 targetMsId（正整数）指定目标抄本');
+    const result = await withTx(async (c) => {
+      const doc = await getDoc(c, id);
+      const mss = await loadMss(c, id);
+      if (!mss.some((m) => m.id === targetMsId)) throw new HttpError(400, '该抄本不属于本文献');
+      if (doc.base_ms_id == null) throw new HttpError(400, '尚未选定底本，无法补配');
+      const data = await loadSupplementData(c, id, doc.base_ms_id, targetMsId);
+      return computePreview(data, id, doc.version, doc.base_ms_id, targetMsId);
+    });
+    res.json(result);
+  })
+);
+
+/**
+ * 提交补配：
+ * POST /api/documents/:id/supplement { expectedVersion, targetMsId, selections }
+ * 以预览时的文献版本号乐观锁；在当前工作版重新核对组、文字、空闲区间及归组规则，
+ * 整批通过才写入，保留未选组与已有片段。版本过期 → 409；候选失效 → 409 拒绝整批且不推进版本；
+ * 请求体本身非法（含组内多处、候选互相重叠）→ 400。成功后版本只推进一次。
+ */
+router.post(
+  '/documents/:id/supplement',
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const targetMsId = req.body?.targetMsId;
+    if (!isInt(targetMsId) || targetMsId <= 0) throw new HttpError(400, '需要 targetMsId（正整数）指定目标抄本');
+    const rawSelections = req.body?.selections;
+    if (!Array.isArray(rawSelections) || rawSelections.length === 0) {
+      throw new HttpError(400, 'selections 必须为非空数组（不补配时无需提交）');
+    }
+    const selections: SupplementSelectionDTO[] = [];
+    const shapeIssues: unknown[] = [];
+    rawSelections.forEach((s, i) => {
+      if (
+        !s || typeof s !== 'object' || !isInt(s.groupId) || !isInt(s.msId) ||
+        !isInt(s.lineId) || !isInt(s.startCp) || !isInt(s.endCp)
+      ) {
+        shapeIssues.push({ index: i, message: '每项需含整数 groupId/msId/lineId/startCp/endCp' });
+        return;
+      }
+      if (s.msId !== targetMsId) {
+        shapeIssues.push({ index: i, groupOrd: undefined, message: `第 ${i + 1} 项 msId 与目标抄本不一致` });
+        return;
+      }
+      if (s.startCp < 0 || s.endCp <= s.startCp) {
+        shapeIssues.push({ index: i, message: `第 ${i + 1} 项区间非法（需 0 ≤ startCp < endCp）` });
+        return;
+      }
+      const dup = selections.some((x) => x.groupId === s.groupId);
+      if (dup) {
+        shapeIssues.push({ index: i, message: `第 ${i + 1} 项：同一组出现多个候选，每组至多采纳一处` });
+        return;
+      }
+      selections.push({
+        groupId: s.groupId,
+        msId: s.msId,
+        lineId: s.lineId,
+        startCp: s.startCp,
+        endCp: s.endCp,
+      });
+    });
+    if (shapeIssues.length > 0) {
+      throw new HttpError(400, '补配请求格式有误，未写入任何内容', shapeIssues);
+    }
+
+    const result = await withTx(async (c) => {
+      const doc = await lockDoc(c, id);
+      checkVersion(doc, req.body?.expectedVersion); // 版本过期 → 409
+      const mss = await loadMss(c, id);
+      if (!mss.some((m) => m.id === targetMsId)) throw new HttpError(400, '该抄本不属于本文献');
+      if (doc.base_ms_id == null) throw new HttpError(400, '尚未选定底本，无法补配');
+
+      const data = await loadSupplementData(c, id, doc.base_ms_id, targetMsId);
+
+      // 1) 显式重核：组 / 缺文 / 已有片段 / 行归属 / 区间 / 文字 / 空闲 / 候选彼此不重叠
+      const issues = recheckSelections(data, selections, doc.base_ms_id);
+      if (issues.length > 0) {
+        throw new HttpError(
+          409,
+          `候选失效：${issues.length} 项在当前工作版核对未通过，已拒绝整批、未写入任何内容，请重新预览`,
+          { code: 'SUPPLEMENT_STALE', currentVersion: doc.version, issues }
+        );
+      }
+
+      // 2) 归组规则全量核对：以“其余完好组现状 + 采纳后的组”拼成全集，
+      //    复用与整批保存完全一致的越界 / 行内重叠 / 每组每抄本至多一片 / 底本唯一校验。
+      //    待修复组不参与补配：其（可能越界的）片段不进入全集；新片段与其区间的冲突
+      //    已在上一步按“全部现存片段”空闲核对中拒绝。
+      const selByGroup = new Map(selections.map((s) => [s.groupId, s]));
+      const otherGroups = data.groups.filter((g) => !selByGroup.has(g.id) && !g.broken);
+      const synthetic: GroupDTO[] = otherGroups.map((g) => ({
+        id: g.id,
+        ord: g.ord,
+        fragments: data.fragments
+          .filter((f) => f.group_id === g.id)
+          .map((f) => ({
+            msId: f.ms_id,
+            missing: f.missing,
+            lineId: f.line_id,
+            startCp: f.start_cp,
+            endCp: f.end_cp,
+          })),
+      }));
+      for (const g of data.groups) {
+        const sel = selByGroup.get(g.id);
+        if (!sel) continue;
+        synthetic.push({
+          id: g.id,
+          ord: g.ord,
+          fragments: [
+            ...data.fragments.filter((f) => f.group_id === g.id).map((f) => ({
+              msId: f.ms_id,
+              missing: f.missing,
+              lineId: f.line_id,
+              startCp: f.start_cp,
+              endCp: f.end_cp,
+            })),
+            { msId: sel.msId, missing: false, lineId: sel.lineId, startCp: sel.startCp, endCp: sel.endCp },
+          ],
+        });
+      }
+      synthetic.sort((a, b) => a.ord - b.ord);
+      const allLines = await loadLines(c, mss.map((m) => m.id));
+      validateGroups(synthetic, { baseMsId: doc.base_ms_id, manuscripts: mss, lines: allLines });
+
+      // 3) 整批通过 → 写入片段（保留未选组与已有片段），版本只推进一次
+      for (const sel of selections) {
+        await c.query(
+          `INSERT INTO fragments (group_id, doc_id, ms_id, line_id, start_cp, end_cp, missing)
+           VALUES ($1,$2,$3,$4,$5,$6,FALSE)`,
+          [sel.groupId, id, sel.msId, sel.lineId, sel.startCp, sel.endCp]
+        );
+      }
+      await bumpVersion(c, id);
+      const after = await getDoc(c, id);
+      return { applied: selections.length, version: after.version };
+    });
+    res.status(201).json({ ok: true, ...result });
   })
 );
 

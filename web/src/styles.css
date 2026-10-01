@@ -121,6 +121,20 @@ input:focus, textarea:focus { outline: 2px solid #d9c9a8; }
 .line-text .ch.cov { background: #dcead9; border-radius: 2px; }
 .line-text .ch.cov-broken { background: #f3ddbb; }
 .line-text .ch.sel { background: #c9d8ea; }
+.line-text .ch.supp-ok { background: #cfe3d2; outline: 1px solid #8bb394; }
+.line-text .ch.supp-cand { background: #d6e0f0; outline: 1px solid #9db2cf; }
+.line-text .ch.supp-picked { background: #b79f5f; color: #fff; outline: 1px solid #8a733a; }
+
+/* ---- 补配 ---- */
+.supp-group-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+.supp-card { border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px; background: #fffdf7; }
+.supp-card.supp-unique { border-left: 4px solid var(--ok); }
+.supp-card.supp-multiple { border-left: 4px solid var(--accent); }
+.supp-card.supp-conflict { border-left: 4px solid var(--warn); }
+.supp-card.supp-none { border-left: 4px solid #b9b0a0; opacity: .92; }
+.supp-cands { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.supp-cand { display: flex; gap: 8px; align-items: baseline; font-size: 14px; cursor: pointer; }
+.supp-cand.picked { font-weight: 600; }
 
 .add-line { display: flex; gap: 8px; margin-top: 8px; }
 .add-line input { flex: 1; }

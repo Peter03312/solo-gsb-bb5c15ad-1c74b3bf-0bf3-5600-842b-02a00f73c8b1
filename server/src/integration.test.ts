@@ -517,6 +517,301 @@ async function main() {
     assert.ok(diff.groupDiff.unpairedOld[0].cells.some((c: any) => c.isBase && c.text === '天命之謂性'),
       '旧组底本文字仍应确定呈现');
 
+    // ---------- 补配：底本文字 → 目标抄本空闲区间候选 ----------
+    // 甲（底）；乙（目标，尚无任何片段）；丁（另一无片段抄本）
+    r = await call(base, 'POST', '/documents', { title: `补配测试 ${++seq}`, manuscripts: ['甲', '乙', '丁'] });
+    assert.strictEqual(r.status, 201);
+    const dS = r.json.id;
+    let sView = (await call(base, 'GET', `/documents/${dS}`)).json;
+    let sVer = sView.document.version;
+    const [sA, sB, sD] = sView.manuscripts;
+    // 甲（底本）行1（14 字，底本片段各占不重叠区间）：
+    //  g1 天命 [0,2)  g2 丙丁 [2,4)  g3 丁戊 [4,6)  g4 戊己 [6,8)
+    //  g5 庚辛 [8,10)  g6 壬癸 [10,12)  g7 子 [12,13)  g8 寅 [13,14)
+    await call(base, 'POST', `/manuscripts/${sA.id}/lines`, {
+      expectedVersion: sVer++, content: '天命丙丁丁戊戊己庚辛壬癸子丑寅',
+    });
+    // 乙（目标，行1；按码点偏移；字符 = 天命丙丁戊己丁戊己X壬癸寅子𠀀，X=占字占位使偏移固定）：
+    //  天命[0,2) g1；丙丁[2,4) 与 丁戊[3,5) 候选互相重叠（冲突）；
+    //  戊己[4,6) 与 [7,9) 两处空闲（multiple）；庚辛 无（none）；壬癸[10,12) 唯一；
+    //  [8,9) 为 g7 已存在片段（占字「庚」，文字与 g7 无关，仅用于占区间→g7 排除、g8 命中处被占）；
+    //  寅[13,14) 被 g7 片段? 否——g8 寅出现在 [12,13)，与 g7[8,9) 不冲突 → 直接改 g7 底本为寅使占用；
+    //  末位𠀀为代理对（1 码点）
+    await call(base, 'POST', `/manuscripts/${sB.id}/lines`, {
+      expectedVersion: sVer++, content: '天命丙丁戊己丁戊己庚壬癸寅子𠀀',
+    });
+    // 丁：行1 只有「天命」
+    await call(base, 'POST', `/manuscripts/${sD.id}/lines`, { expectedVersion: sVer++, content: '天命' });
+    sView = (await call(base, 'GET', `/documents/${dS}`)).json;
+    const sa1 = sView.rawByMs.find((x: any) => x.msId === sA.id).lines[0].lineId;
+    const sb1 = sView.rawByMs.find((x: any) => x.msId === sB.id).lines[0].lineId;
+
+    const sGroups = [
+      { ord: 1, fragments: [{ msId: sA.id, lineId: sa1, startCp: 0, endCp: 2 }] },  // 天命
+      { ord: 2, fragments: [{ msId: sA.id, lineId: sa1, startCp: 2, endCp: 4 }] },  // 丙丁
+      { ord: 3, fragments: [{ msId: sA.id, lineId: sa1, startCp: 4, endCp: 6 }] },  // 丁戊
+      { ord: 4, fragments: [{ msId: sA.id, lineId: sa1, startCp: 6, endCp: 8 }] },  // 戊己
+      { ord: 5, fragments: [{ msId: sA.id, lineId: sa1, startCp: 8, endCp: 10 }] }, // 庚辛（无）
+      { ord: 6, fragments: [{ msId: sA.id, lineId: sa1, startCp: 10, endCp: 12 }] },// 壬癸
+      { ord: 7, fragments: [
+        { msId: sA.id, lineId: sa1, startCp: 13, endCp: 14 },                        // 寅
+        { msId: sB.id, lineId: sb1, startCp: 12, endCp: 13 },                        // 寅（乙已有片段→排除、占住目标寅）
+      ]},
+    ];
+    r = await call(base, 'PUT', `/documents/${dS}/groups`, { expectedVersion: sView.document.version, groups: sGroups });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    sView = (await call(base, 'GET', `/documents/${dS}`)).json;
+    const gById = new Map<number, any>(sView.groups.map((g: any) => [g.ord, g] as [number, any]));
+    const verAfterGroups = sView.document.version;
+
+    // 制造一个待修复组（改甲行使 g1 底本片段越界）：先补一个 g8 只在甲，再删短甲行后恢复组——
+    // 直接改字相交即可令某组 broken：改甲行第 0 字相交 g1
+    r = await call(base, 'PUT', `/lines/${sa1}`, {
+      expectedVersion: sView.document.version, startCp: 0, endCp: 1, replacement: 'X',
+    });
+    assert.strictEqual(r.status, 200);
+    sView = (await call(base, 'GET', `/documents/${dS}`)).json;
+    assert.strictEqual(sView.groups.find((g: any) => g.ord === 1).broken, true, 'g1 应为待修复');
+    // 恢复甲行文字（组仍 broken，只增不减）
+    r = await call(base, 'PUT', `/lines/${sa1}`, {
+      expectedVersion: sView.document.version, startCp: 0, endCp: 1, replacement: '天',
+    });
+    assert.strictEqual(r.status, 200);
+    sView = (await call(base, 'GET', `/documents/${dS}`)).json;
+    assert.strictEqual(sView.groups.find((g: any) => g.ord === 1).broken, true);
+
+    // 对乙预览：g1 待修复排除；g7 乙已有片段排除；其余 g2..g6 纳入（5 组）
+    let prev: any = (await call(base, 'GET', `/documents/${dS}/supplement/preview?targetMsId=${sB.id}`)).json;
+    assert.strictEqual(prev.version, sView.document.version, '预览携带当前版本号');
+    assert.strictEqual(prev.eligibleGroupCount, 5);
+    assert.strictEqual(prev.excludedGroupCount, 2, 'g1 待修复 + g7 已有片段');
+    const pByOrd = new Map<number, any>(prev.groups.map((g: any) => [g.ord, g] as [number, any]));
+    // g2 丙丁：候选 [2,4) 唯一，但与 g3 丁戊候选 [3,5) 重叠 → conflict，不可直接采纳
+    const pg2 = pByOrd.get(2);
+    assert.strictEqual(pg2.status, 'conflict');
+    assert.strictEqual(pg2.adoptable, false);
+    assert.strictEqual(pg2.candidates.length, 1);
+    assert.deepStrictEqual(pg2.candidates[0].conflictsWithGroupIds, [gById.get(3).id]);
+    // g3 丁戊本身两处（multiple），其中 [3,5) 与 g2 冲突、[6,8) 与 g4 冲突，均显式标出
+    const pg3 = pByOrd.get(3);
+    assert.strictEqual(pg3.status, 'multiple');
+    assert.deepStrictEqual(pg3.candidates.map((x: any) => [x.startCp, x.endCp]), [[3, 5], [6, 8]]);
+    assert.deepStrictEqual(pg3.candidates[0].conflictsWithGroupIds, [gById.get(2).id, gById.get(4).id]);
+    // g4 戊己：[4,6) 与 [7,9) 两处空闲 → multiple
+    const pg4 = pByOrd.get(4);
+    assert.strictEqual(pg4.status, 'multiple');
+    assert.strictEqual(pg4.adoptable, false);
+    assert.strictEqual(pg4.candidates.length, 2);
+    assert.deepStrictEqual(pg4.candidates.map((x: any) => [x.startCp, x.endCp]), [[4, 6], [7, 9]]);
+    // g5 庚辛：无候选
+    assert.strictEqual(pByOrd.get(5).status, 'none');
+    assert.strictEqual(pByOrd.get(5).candidates.length, 0);
+    // g6 壬癸：[10,12) 唯一无冲突 → unique 可直接采纳
+    const pg6 = pByOrd.get(6);
+    assert.strictEqual(pg6.status, 'unique');
+    assert.strictEqual(pg6.adoptable, true);
+    assert.strictEqual(pg6.candidates[0].lineNo, 1);
+    assert.strictEqual(pg6.candidates[0].startCp, 10);
+    assert.strictEqual(pg6.candidates[0].endCp, 12);
+
+    // 预览只读：版本不变
+    assert.strictEqual((await call(base, 'GET', `/documents/${dS}`)).json.document.version, sView.document.version);
+
+    // 目标抄本 = 底本：所有完好组都已有底本片段，纳入 0 组
+    const prevBase = (await call(base, 'GET', `/documents/${dS}/supplement/preview?targetMsId=${sA.id}`)).json;
+    assert.strictEqual(prevBase.eligibleGroupCount, 0);
+    // 缺 targetMsId → 400；非本文献抄本 → 400
+    await expectFail(await call(base, 'GET', `/documents/${dS}/supplement/preview`), 400, 'targetMsId');
+
+    // 对丁预览：g2..g7 均无同文（丁行只有「天命」），全部 none
+    const prevD = (await call(base, 'GET', `/documents/${dS}/supplement/preview?targetMsId=${sD.id}`)).json;
+    assert.strictEqual(prevD.eligibleGroupCount, 6);
+    assert.ok(prevD.groups.every((g: any) => g.status === 'none'), '丁行无其余底本文字');
+
+    // 码点安全：乙行末「𠀀」为代理对；修复 g1 时把底本片段指向甲第 2 行的「天命」之外的𠀀，
+    // 验证候选按码点计 1。甲第 2 行仅含该扩展 B 区字。
+    await call(base, 'POST', `/manuscripts/${sA.id}/lines`, { expectedVersion: sView.document.version, content: '𠀀' });
+    sView = (await call(base, 'GET', `/documents/${dS}`)).json;
+    const sa2 = sView.rawByMs.find((x: any) => x.msId === sA.id).lines.find((l: any) => l.lineNo === 2).lineId;
+    r = await call(base, 'PUT', `/documents/${dS}/groups/${gById.get(1).id}/repair`, {
+      expectedVersion: sView.document.version,
+      group: { ord: 1, fragments: [{ msId: sA.id, lineId: sa2, startCp: 0, endCp: 1 }] },
+    });
+    assert.strictEqual(r.status, 200, `把 g1 修复为底本「𠀀」: ${JSON.stringify(r.json)}`);
+    prev = (await call(base, 'GET', `/documents/${dS}/supplement/preview?targetMsId=${sB.id}`)).json;
+    const pg1 = prev.groups.find((g: any) => g.ord === 1);
+    assert.ok(pg1, 'g1 修复后应纳入补配');
+    assert.strictEqual(pg1.status, 'unique');
+    assert.strictEqual(pg1.candidates[0].startCp, 14, '𠀀 按码点为第 15 字（偏移 14）');
+    assert.strictEqual(pg1.candidates[0].endCp, 15);
+    assert.strictEqual(pg1.candidates[0].text, '𠀀');
+    const verBeforeCommit = (await call(base, 'GET', `/documents/${dS}`)).json.document.version;
+
+    // 冲突组各选一处（g2 丙丁 [2,4) + g3 丁戊 [3,5)，预览已标 conflict）：
+    // 提交时在当前版重核为候选互相重叠 → 409 SELECTION_OVERLAP，整批拒绝、不写入、不推进
+    r = await call(base, 'POST', `/documents/${dS}/supplement`, {
+      expectedVersion: verBeforeCommit,
+      targetMsId: sB.id,
+      selections: [
+        { groupId: gById.get(2).id, msId: sB.id, lineId: sb1, startCp: 2, endCp: 4 },
+        { groupId: gById.get(3).id, msId: sB.id, lineId: sb1, startCp: 3, endCp: 5 },
+      ],
+    });
+    await expectFail(r, 409, '候选失效');
+    assert.ok(r.json.details.issues.some((i: any) => i.code === 'SELECTION_OVERLAP'));
+    assert.strictEqual((await call(base, 'GET', `/documents/${dS}`)).json.document.version, verBeforeCommit,
+      '重叠整批拒绝不推进');
+
+    // 提交：g1(𠀀) + g2(丙丁) + g4 第二处(戊己 [7,9)) + g6(壬癸)；
+    // 跳过冲突对的 g3、多候选 g4 第一处、无候选 g5、已有片段 g7
+    r = await call(base, 'POST', `/documents/${dS}/supplement`, {
+      expectedVersion: verBeforeCommit,
+      targetMsId: sB.id,
+      selections: [
+        { groupId: gById.get(1).id, msId: sB.id, lineId: sb1, startCp: 14, endCp: 15 },
+        { groupId: gById.get(2).id, msId: sB.id, lineId: sb1, startCp: 2, endCp: 4 },
+        { groupId: gById.get(4).id, msId: sB.id, lineId: sb1, startCp: 7, endCp: 9 },
+        { groupId: gById.get(6).id, msId: sB.id, lineId: sb1, startCp: 10, endCp: 12 },
+      ],
+    });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    assert.strictEqual(r.json.applied, 4);
+    assert.strictEqual(r.json.version, verBeforeCommit + 1, '整批只推进一次版本');
+
+    // 写入后读模型：相应组在乙有同文片段，未选组保持不变
+    sView = (await call(base, 'GET', `/documents/${dS}`)).json;
+    for (const ord of [1, 2, 4, 6]) {
+      const cell = sView.groups.find((g: any) => g.ord === ord).cells.find((c: any) => c.msId === sB.id);
+      assert.ok(cell && !cell.missing && cell.startCp != null, `g${ord} 应已有乙片段`);
+    }
+    const g3cell = sView.groups.find((g: any) => g.ord === 3).cells.find((c: any) => c.msId === sB.id);
+    assert.ok(!g3cell || (!g3cell.missing && g3cell.startCp == null), '未选的 g3 不应被写入');
+    assert.strictEqual(sView.stats.brokenCount, 0, '补配不改变待修复状态，且现已无待修复');
+
+    // 重新预览：已补配的 g1/g2/g4/g6 与 g7 排除，仅余 g3、g5；
+    //  g3「丁戊」[3,5) 与新写入的 g2 片段 [2,4) 重叠 → 不再是候选 → none
+    prev = (await call(base, 'GET', `/documents/${dS}/supplement/preview?targetMsId=${sB.id}`)).json;
+    assert.strictEqual(prev.eligibleGroupCount, 2);
+    assert.strictEqual(prev.groups.find((g: any) => g.ord === 3).status, 'none',
+      '冲突对方被采纳后，g3 候选因占用现存片段而消失');
+    assert.strictEqual(prev.groups.find((g: any) => g.ord === 5).status, 'none');
+
+    // 过期版本提交 → 409，不写入、不推进
+    const verNow = (await call(base, 'GET', `/documents/${dS}`)).json.document.version;
+    r = await call(base, 'POST', `/documents/${dS}/supplement`, {
+      expectedVersion: verBeforeCommit,
+      targetMsId: sD.id,
+      selections: [{ groupId: gById.get(1).id, msId: sD.id, lineId: sa2, startCp: 0, endCp: 1 }],
+    });
+    await expectFail(r, 409, '版本已过期');
+    assert.strictEqual((await call(base, 'GET', `/documents/${dS}`)).json.document.version, verNow, '409 不推进版本');
+
+    // 候选失效：对丁提交 g1（丁行无「𠀀」）→ 409 整批拒绝、不推进、原因 TEXT_MISMATCH/越界
+    r = await call(base, 'POST', `/documents/${dS}/supplement`, {
+      expectedVersion: verNow,
+      targetMsId: sD.id,
+      selections: [
+        { groupId: gById.get(1).id, msId: sD.id, lineId: sa2, startCp: 0, endCp: 1 }, // 行属于甲，不属于丁
+      ],
+    });
+    await expectFail(r, 409, '候选失效');
+    assert.ok(r.json.details.issues.some((i: any) => i.code === 'BAD_LINE'));
+    assert.strictEqual(r.json.details.code, 'SUPPLEMENT_STALE');
+    assert.strictEqual((await call(base, 'GET', `/documents/${dS}`)).json.document.version, verNow);
+
+    // 候选失效：对乙再次提交 g6（乙已有该片段）→ ALREADY_HAS_FRAGMENT
+    r = await call(base, 'POST', `/documents/${dS}/supplement`, {
+      expectedVersion: verNow,
+      targetMsId: sB.id,
+      selections: [{ groupId: gById.get(6).id, msId: sB.id, lineId: sb1, startCp: 10, endCp: 12 }],
+    });
+    await expectFail(r, 409, '候选失效');
+    assert.ok(r.json.details.issues.some((i: any) => i.code === 'ALREADY_HAS_FRAGMENT'));
+
+    // 请求体非法：区间非法 / 同一组两个候选 → 400（不写库、不推进）
+    r = await call(base, 'POST', `/documents/${dS}/supplement`, {
+      expectedVersion: verNow,
+      targetMsId: sB.id,
+      selections: [{ groupId: gById.get(3).id, msId: sB.id, lineId: sb1, startCp: 0, endCp: 0 }],
+    });
+    await expectFail(r, 400, '区间非法');
+    r = await call(base, 'POST', `/documents/${dS}/supplement`, {
+      expectedVersion: verNow,
+      targetMsId: sD.id,
+      selections: [
+        { groupId: gById.get(6).id, msId: sD.id, lineId: sb1, startCp: 0, endCp: 1 },
+        { groupId: gById.get(6).id, msId: sD.id, lineId: sb1, startCp: 1, endCp: 2 },
+      ],
+    });
+    await expectFail(r, 400, '同一组');
+    // 空 selections → 400
+    await expectFail(
+      await call(base, 'POST', `/documents/${dS}/supplement`, { expectedVersion: verNow, targetMsId: sD.id, selections: [] }),
+      400, 'selections'
+    );
+
+    // 已被占用区间 / 文字不符：新增甲第 3 行「子寅」，整批重存当前全部组 + g8(底本子) + g9(底本寅)。
+    //  g9「寅」在乙行唯一出现处 [12,13) 被 g7 片段占用 → 无候选、提交 OCCUPIED；
+    //  g8「子」在乙行无出现 → 无候选；提交空闲 [13,14)（寅≠子）→ TEXT_MISMATCH。
+    await call(base, 'POST', `/manuscripts/${sA.id}/lines`, { expectedVersion: verNow, content: '子寅' });
+    sView = (await call(base, 'GET', `/documents/${dS}`)).json;
+    const saExtra = sView.rawByMs.find((x: any) => x.msId === sA.id).lines.find((l: any) => l.lineNo === 3).lineId;
+    const verAfterExtraLine = sView.document.version;
+    const rebuilt = sView.groups.map((g: any) => ({
+      ord: g.ord,
+      fragments: g.cells
+        .filter((c: any) => c.missing || c.startCp != null)
+        .map((c: any) => {
+          if (c.missing) return { msId: c.msId, missing: true };
+          const ln = sView.rawByMs.find((x: any) => x.msId === c.msId)
+            .lines.find((l: any) => l.lineNo === c.lineNo);
+          return { msId: c.msId, lineId: ln.lineId, startCp: c.startCp, endCp: c.endCp };
+        }),
+    }));
+    rebuilt.push({ ord: rebuilt.length + 1, fragments: [{ msId: sA.id, lineId: saExtra, startCp: 0, endCp: 1 }] }); // g8 子
+    rebuilt.push({ ord: rebuilt.length + 1, fragments: [{ msId: sA.id, lineId: saExtra, startCp: 1, endCp: 2 }] }); // g9 寅
+    r = await call(base, 'PUT', `/documents/${dS}/groups`, { expectedVersion: verAfterExtraLine, groups: rebuilt });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    sView = (await call(base, 'GET', `/documents/${dS}`)).json;
+    const verAfterG8 = sView.document.version;
+    const g8id = sView.groups.find((g: any) => g.ord === 8).id;
+    const g9id = sView.groups.find((g: any) => g.ord === 9).id;
+    const gnewPrev = (await call(base, 'GET', `/documents/${dS}/supplement/preview?targetMsId=${sB.id}`)).json;
+    assert.strictEqual(gnewPrev.groups.find((g: any) => g.groupId === g8id).status, 'unique',
+      '乙行「子」[13,14) 空闲唯一');
+    assert.strictEqual(gnewPrev.groups.find((g: any) => g.groupId === g9id).status, 'none',
+      '乙行「寅」唯一出现处 [12,13) 已被 g7 片段占用，g9 无空闲候选');
+    // g9 强行提交被占区间 → OCCUPIED
+    r = await call(base, 'POST', `/documents/${dS}/supplement`, {
+      expectedVersion: verAfterG8,
+      targetMsId: sB.id,
+      selections: [{ groupId: g9id, msId: sB.id, lineId: sb1, startCp: 12, endCp: 13 }],
+    });
+    await expectFail(r, 409, '候选失效');
+    assert.ok(r.json.details.issues.some((i: any) => i.code === 'OCCUPIED'));
+    // g8 唯一空闲候选直接采纳成功（此时 [13,14) 仍空闲）
+    r = await call(base, 'POST', `/documents/${dS}/supplement`, {
+      expectedVersion: verAfterG8,
+      targetMsId: sB.id,
+      selections: [{ groupId: g8id, msId: sB.id, lineId: sb1, startCp: 13, endCp: 14 }],
+    });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    assert.strictEqual(r.json.applied, 1);
+    const verAfterG8Apply = r.json.version;
+    // 文字不符：g9 底本「寅」提交 [13,14)，该位置现已是 g8「子」→ TEXT_MISMATCH（同时也 OCCUPIED）
+    r = await call(base, 'POST', `/documents/${dS}/supplement`, {
+      expectedVersion: verAfterG8Apply,
+      targetMsId: sB.id,
+      selections: [{ groupId: g9id, msId: sB.id, lineId: sb1, startCp: 13, endCp: 14 }],
+    });
+    await expectFail(r, 409, '候选失效');
+    assert.ok(r.json.details.issues.some((i: any) => i.code === 'TEXT_MISMATCH' || i.code === 'OCCUPIED'));
+    assert.strictEqual((await call(base, 'GET', `/documents/${dS}`)).json.document.version, verAfterG8Apply,
+      '失败不推进版本');
+
+    // 不存在文献的预览 → 404
+    await expectFail(await call(base, 'GET', `/documents/999999/supplement/preview?targetMsId=1`), 404, '不存在');
+
     console.log('✅ 全部集成测试通过');
   } finally {
     await close();

@@ -202,3 +202,51 @@ export interface EditionDiff {
     counts: { paired: number; pairedChanged: number; unpairedOld: number; unpairedNew: number };
   };
 }
+
+// ---- 补配（按底本文字在目标抄本空闲区间预配片段）----
+
+export type SupplementGroupStatus = 'unique' | 'multiple' | 'none' | 'conflict';
+
+export interface SupplementCandidate {
+  lineId: number;
+  lineNo: number;
+  startCp: number;
+  endCp: number;
+  text: string;
+  conflictsWithGroupIds: number[];
+}
+
+export interface SupplementGroup {
+  groupId: number;
+  ord: number;
+  baseText: string;
+  status: SupplementGroupStatus;
+  adoptable: boolean;
+  reason: string;
+  candidates: SupplementCandidate[];
+}
+
+export interface SupplementPreview {
+  documentId: number;
+  version: number;
+  baseMsId: number | null;
+  targetMsId: number;
+  targetMsName: string;
+  eligibleGroupCount: number;
+  excludedGroupCount: number;
+  groups: SupplementGroup[];
+}
+
+export interface SupplementSelection {
+  groupId: number;
+  msId: number;
+  lineId: number;
+  startCp: number;
+  endCp: number;
+}
+
+export interface SupplementResult {
+  ok: boolean;
+  applied: number;
+  version: number;
+}

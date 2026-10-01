@@ -108,6 +108,52 @@ npm run dev          # http://localhost:5173 （/api 自动代理到 4000）
 - 切换底本后，不含新底本片段的组全部待修复。
 - **修复前不得发布新校勘版**；待修复组需逐组重录并通过同一套校验。
 
+### 补配（按底本文字，在目标抄本空闲区间预配片段）
+工作区「补配」页签（也可直接调 HTTP API）：选定**文献与目标抄本**后，按**完好对应组的底本文字**，
+在该抄本**原始行文**中预览补配候选。
+
+- **纳入范围**：仅考虑该抄本**尚无片段且未标缺文**的完好组；**待修复组不参与补配**
+  （该抄本已有片段 / 已标缺文 / 底本文字不可用的组在响应中计入 `excludedGroupCount`，不返回候选）。
+- **候选判定**：必须是该抄本**某一单行内**与底本文字**逐码点完整相同**的文字，
+  按 Unicode 码点返回 `lineId/lineNo/startCp/endCp`（左闭右开），且**不占用任何现有片段区间**
+  （含待修复组现存片段；端点相接不算占用）。
+- **每组状态与原因**：
+  - `unique`：候选**唯一且无冲突** → `adoptable=true`，可直接采纳；
+  - `multiple`：空闲位置有多处相同文字 → 由人选一处或跳过；
+  - `conflict`：候选唯一，但其区间与**其他组**候选区间在同一行重叠（候选上给 `conflictsWithGroupIds`）；
+  - `none`：空闲区间内无相同文字。每组都带中文 `reason`。
+- **提交**：提交所选候选及**预览时的文献版本号**。服务端在**当前工作版**重新核对
+  组仍存在且完好、该抄本仍无片段且未标缺文、区间合法且落在自己行内、文字仍等于底本文字、
+  不占现存片段区间，并对“其余完好组 + 采纳后的组”跑**同一套归组规则全量校验**，
+  **整批通过才写入**；未选组与已有片段一律保留。
+  - 版本过期（`expectedVersion` ≠ 当前版本）→ **409**，不写入；
+  - 候选在当前版核对失败（组已删 / 已待修复 / 已有片段 / 已标缺文 / 行已变 / 越界 / 文字已变 /
+    区间被占 / 同批候选彼此重叠）→ **409**，`details.code=SUPPLEMENT_STALE`、`details.issues[]`
+    逐条给出 `code` 与位置（组序 / 行号 / 码点区间），**拒绝整批且不推进版本**；
+  - 请求体本身非法（缺字段、区间非法、同组给多个候选、空 `selections`）→ 400。
+  - **成功后文献版本只推进一次**，返回 `{ ok, applied, version }`。
+
+接口：
+
+```bash
+# 预览（只读，不推进版本）
+curl 'http://localhost:4000/api/documents/1/supplement/preview?targetMsId=2'
+# 提交所选候选（携带预览响应里的 version）
+curl -X POST http://localhost:4000/api/documents/1/supplement \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expectedVersion": 7,
+    "targetMsId": 2,
+    "selections": [
+      { "groupId": 11, "msId": 2, "lineId": 15, "startCp": 0, "endCp": 5 }
+    ]
+  }'
+```
+
+预览返回：`version/baseMsId/targetMsId/targetMsName`、`eligibleGroupCount/excludedGroupCount`、
+`groups[]`（每组 `groupId/ord/baseText/status/adoptable/reason/candidates[]`，
+候选含 `lineId/lineNo/startCp/endCp/text/conflictsWithGroupIds`）。
+
 ### 发布与旧版
 - 发布生成 **不可变快照**（JSONB，固化发布定稿时的版本号）。发布后继续修改只影响工作版，
   **旧发布版始终可阅读**（“发布与旧版”页签 → 阅读此版）。
@@ -159,6 +205,8 @@ npm run dev          # http://localhost:5173 （/api 自动代理到 4000）
 | PUT | `/api/documents/:id/groups` | 整批保存对应组（替换式，全量校验） |
 | PUT | `/api/documents/:id/groups/:gid/repair` | 修复单个对应组 |
 | DELETE | `/api/documents/:id/groups/:gid` | 删除对应组 |
+| GET | `/api/documents/:id/supplement/preview?targetMsId=` | **补配预览**（只读）：目标抄本空闲区间内的同文候选 |
+| POST | `/api/documents/:id/supplement` | **提交补配**（整批重核；过期 409 / 候选失效 409 不推进） |
 | POST | `/api/documents/:id/publish` | 发布新版（有待修复组则 409） |
 | GET | `/api/documents/:id/editions` / `…/editions/:no` | 版本列表 / 阅读旧版快照 |
 | GET | `/api/documents/:id/editions/:no/diff` | **该已发布版与当前工作版的版本对照**（旧版不存在 → 404） |
@@ -181,7 +229,12 @@ npm test
 修复流程、发布门禁、旧版快照可读、切换底本，以及
 **版本对照：行文增删改（按原始行号）、整批重存换组 ID 仍按底本位置唯一配对、
 无法配对组分别列出且不推断移动、底本不同不配对、缺文标记变化、待修复组显式标识且越界文字不作确定文字、
-旧版不存在 404、对照只读且刷新反映最新工作版**。
+旧版不存在 404、对照只读且刷新反映最新工作版，以及
+**补配：仅纳入无片段且未缺文的完好组（待修复/已有片段/已缺文排除）、单行完整同文且按码点定位、
+避开全部现存片段区间、unique/multiple/conflict/none 状态与原因、组间候选区间重叠标注、
+唯一无冲突可采纳、多候选与冲突须人选取舍、提交在当前版重核组/文字/空闲区间/归组规则且整批通过才写入、
+未选组与已有片段保留、预览只读不推进、过期版本 409、候选失效（已占/文字已变/越界/行易主/已有片段/候选互相重叠）
+整批拒绝且不推进、成功只推进一次版本、扩展 B 区生僻字按码点计、请求体非法 400、文献不存在 404**。
 
 ---
 

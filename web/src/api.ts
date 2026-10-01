@@ -62,6 +62,27 @@ export const api = {
     ),
   getEditionDiff: (id: number, no: number) =>
     req<EditionDiff>('GET', `/api/documents/${id}/editions/${no}/diff`),
+  supplementPreview: (id: number, targetMsId: number) =>
+    req<SupplementPreview>('GET', `/api/documents/${id}/supplement/preview?targetMsId=${targetMsId}`),
+  supplementCommit: (
+    id: number,
+    expectedVersion: number,
+    targetMsId: number,
+    selections: SupplementSelection[]
+  ) =>
+    req<SupplementResult>('POST', `/api/documents/${id}/supplement`, {
+      expectedVersion,
+      targetMsId,
+      selections,
+    }),
 };
 
-import type { CollationView, DocumentSummary, EditionDiff, EditionSummary } from './types';
+import type {
+  CollationView,
+  DocumentSummary,
+  EditionDiff,
+  EditionSummary,
+  SupplementPreview,
+  SupplementResult,
+  SupplementSelection,
+} from './types';

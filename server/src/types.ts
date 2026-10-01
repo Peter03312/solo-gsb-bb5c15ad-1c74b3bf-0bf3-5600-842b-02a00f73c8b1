@@ -39,6 +39,52 @@ export interface FragmentRow {
   missing: boolean;
 }
 
+// ---- 补配：按完好对应组的底本文字，在目标抄本原始行文的空闲区间里预配片段 ----
+
+export type SupplementGroupStatus = 'unique' | 'multiple' | 'none' | 'conflict';
+
+export interface SupplementCandidate {
+  lineId: number;
+  lineNo: number;
+  startCp: number;              // Unicode 码点偏移（左闭）
+  endCp: number;                // Unicode 码点偏移（右开）
+  text: string;                 // 必与底本文字完整相同
+  /** 与其他组候选在同一行区间重叠时，那些组的 id（同组多处候选互不列入）。 */
+  conflictsWithGroupIds: number[];
+}
+
+export interface SupplementGroup {
+  groupId: number;
+  ord: number;
+  baseText: string;
+  /** unique=候选唯一且无冲突（可直接采纳）；multiple=多处；none=无；conflict=唯一但与他组候选重叠。 */
+  status: SupplementGroupStatus;
+  adoptable: boolean;
+  reason: string;
+  candidates: SupplementCandidate[];
+}
+
+export interface SupplementPreview {
+  documentId: number;
+  version: number;
+  baseMsId: number | null;
+  targetMsId: number;
+  targetMsName: string;
+  /** 纳入补配考虑的完好组数（目标抄本无片段且未标缺文）。 */
+  eligibleGroupCount: number;
+  /** 未纳入的组数：待修复 / 已有片段 / 已标缺文 / 底本文字不可用。 */
+  excludedGroupCount: number;
+  groups: SupplementGroup[];
+}
+
+export interface SupplementSelectionDTO {
+  groupId: number;
+  msId: number;
+  lineId: number;
+  startCp: number;
+  endCp: number;
+}
+
 export interface EditionRow {
   id: number;
   doc_id: number;

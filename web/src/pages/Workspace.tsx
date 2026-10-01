@@ -3,11 +3,12 @@ import { api, ApiError } from '../api';
 import type { CollationView } from '../types';
 import { TranscribeTab } from './TranscribeTab';
 import { GroupTab } from './GroupTab';
+import { SupplementTab } from './SupplementTab';
 import { CollationPage } from './CollationPage';
 import { PublishTab } from './PublishTab';
 import { ErrorBox } from '../ErrorBox';
 
-type Tab = 'transcribe' | 'group' | 'collation' | 'publish';
+type Tab = 'transcribe' | 'group' | 'supplement' | 'collation' | 'publish';
 
 export function Workspace({
   docId,
@@ -93,6 +94,9 @@ export function Workspace({
           <button className={tab === 'group' ? 'active' : ''} onClick={() => setTab('group')}>
             对应组归组
           </button>
+          <button className={tab === 'supplement' ? 'active' : ''} onClick={() => setTab('supplement')}>
+            补配
+          </button>
           <button className={tab === 'collation' ? 'active' : ''} onClick={() => setTab('collation')}>
             校勘对照
           </button>
@@ -106,6 +110,9 @@ export function Workspace({
         )}
         {tab === 'group' && (
           <GroupTab view={view} version={version} reload={reload} onError={raise} onNotice={flash} />
+        )}
+        {tab === 'supplement' && (
+          <SupplementTab view={view} version={version} reload={reload} onError={raise} onNotice={flash} />
         )}
         {tab === 'collation' && <CollationPage view={view} />}
         {tab === 'publish' && (
