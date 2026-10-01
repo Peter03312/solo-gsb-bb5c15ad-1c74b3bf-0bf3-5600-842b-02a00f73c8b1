@@ -517,6 +517,338 @@ async function main() {
     assert.ok(diff.groupDiff.unpairedOld[0].cells.some((c: any) => c.isBase && c.text === '天命之謂性'),
       '旧组底本文字仍应确定呈现');
 
+    // ---------- 自动补配：候选预览 + 整批提交 ----------
+    // 独立文献，避免受上面流程干扰
+    r = await call(base, 'POST', '/documents', { title: `补配测试 ${++seq}`, manuscripts: ['底本', '乙', '丙'] });
+    assert.strictEqual(r.status, 201);
+    const ds = r.json.id;
+    let dsv = (await call(base, 'GET', `/documents/${ds}`)).json;
+    let dsver = dsv.document.version;
+    const [sA, sB, sC] = dsv.manuscripts;
+    // 底本（甲）：
+    //  行1 天命之謂性率性之謂道
+    //  行2 天命之謂性修道之謂教
+    // 乙本（补配目标）：
+    //  行1 序天命之謂性率性之謂道
+    //  行2 天命之謂性天命之謂性修道之謂教   （组1底本文字出现两次）
+    //  行3 不相干文
+    // 丙本：
+    //  行1 天命之謂性
+    await call(base, 'POST', `/manuscripts/${sA.id}/lines`, { expectedVersion: dsver++, content: '天命之謂性率性之謂道' });
+    await call(base, 'POST', `/manuscripts/${sA.id}/lines`, { expectedVersion: dsver++, content: '天命之謂性修道之謂教' });
+    await call(base, 'POST', `/manuscripts/${sB.id}/lines`, { expectedVersion: dsver++, content: '序天命之謂性率性之謂道' });
+    await call(base, 'POST', `/manuscripts/${sB.id}/lines`, { expectedVersion: dsver++, content: '天命之謂性天命之謂性修道之謂教' });
+    await call(base, 'POST', `/manuscripts/${sB.id}/lines`, { expectedVersion: dsver++, content: '不相干文' });
+    await call(base, 'POST', `/manuscripts/${sC.id}/lines`, { expectedVersion: dsver++, content: '天命之謂性' });
+    dsv = (await call(base, 'GET', `/documents/${ds}`)).json;
+    const sLine = (msId: number, n: number) =>
+      dsv.rawByMs.find((x: any) => x.msId === msId).lines.find((l: any) => l.lineNo === n).lineId;
+    const sa1 = sLine(sA.id, 1), sa2 = sLine(sA.id, 2);
+    const sb1 = sLine(sB.id, 1), sb2 = sLine(sB.id, 2);
+    const sc1 = sLine(sC.id, 1);
+
+    // 归组时乙本（sB）全部缺席：组1「天命之謂性」、组2「率性之謂道」、组3「修道之謂教」；
+    // 丙本组2显式缺文
+    const supplyGroups = [
+      { ord: 1, fragments: [
+        { msId: sA.id, lineId: sa1, startCp: 0, endCp: 5 },
+        { msId: sC.id, lineId: sc1, startCp: 0, endCp: 5 },
+      ]},
+      { ord: 2, fragments: [
+        { msId: sA.id, lineId: sa1, startCp: 5, endCp: 10 },
+        { msId: sC.id, missing: true },
+      ]},
+      { ord: 3, fragments: [
+        { msId: sA.id, lineId: sa2, startCp: 5, endCp: 10 },
+        { msId: sC.id, missing: true },
+      ]},
+    ];
+    r = await call(base, 'PUT', `/documents/${ds}/groups`, { expectedVersion: dsv.document.version, groups: supplyGroups });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    dsv = (await call(base, 'GET', `/documents/${ds}`)).json;
+    const afterGroupVer = dsv.document.version;
+
+    // 预览：目标 = 乙本
+    let pv = (await call(base, 'GET', `/documents/${ds}/supply-preview?msId=${sB.id}`)).json;
+    assert.strictEqual(pv.version, afterGroupVer);
+    assert.strictEqual(pv.targetMsId, sB.id);
+    assert.strictEqual(pv.eligibleGroupCount, 3, '三组在乙本上均无片段且未标缺文');
+    const pg = (ord: number) => pv.groups.find((x: any) => x.ord === ord);
+    // 组2「率性之謂道」：乙本行1「序天命之謂性率性之謂道」[6,11) 唯一空闲 → 可直接采纳
+    assert.strictEqual(pg(2).adoptable, true);
+    assert.strictEqual(pg(2).candidates.length, 1);
+    assert.deepStrictEqual(
+      { lineNo: pg(2).candidates[0].lineNo, s: pg(2).candidates[0].startCp, e: pg(2).candidates[0].endCp },
+      { lineNo: 1, s: 6, e: 11 }
+    );
+    // 组3「修道之謂教」：乙本行2末尾 [10,15) 唯一空闲 → 可直接采纳
+    assert.strictEqual(pg(3).adoptable, true);
+    assert.deepStrictEqual(
+      { lineNo: pg(3).candidates[0].lineNo, s: pg(3).candidates[0].startCp, e: pg(3).candidates[0].endCp },
+      { lineNo: 2, s: 10, e: 15 }
+    );
+    // 组1「天命之謂性」：乙本行1 [1,6)、行2 [0,5)、行2 [5,10) 三处空闲 → 多候选
+    assert.strictEqual(pg(1).adoptable, false);
+    assert.strictEqual(pg(1).reason, 'multiple-candidates');
+    assert.strictEqual(pg(1).candidates.length, 3);
+    assert.strictEqual(pv.adoptableCount, 2);
+
+    // 目标不能是底本 → 400
+    r = await call(base, 'GET', `/documents/${ds}/supply-preview?msId=${sA.id}`);
+    await expectFail(r, 400, '底本');
+
+    // 提交：选组1行1 [1,6)、组2（自动候选）、组3（自动候选）
+    const sel1 = pg(1).candidates.find((c: any) => c.lineNo === 1);
+    const sel2 = pg(2).candidates[0];
+    const sel3 = pg(3).candidates[0];
+    r = await call(base, 'POST', `/documents/${ds}/supply`, {
+      expectedVersion: afterGroupVer,
+      msId: sB.id,
+      selections: [
+        { groupId: pg(1).groupId, lineId: sel1.lineId, startCp: sel1.startCp, endCp: sel1.endCp },
+        { groupId: pg(2).groupId, lineId: sel2.lineId, startCp: sel2.startCp, endCp: sel2.endCp },
+        { groupId: pg(3).groupId, lineId: sel3.lineId, startCp: sel3.startCp, endCp: sel3.endCp },
+      ],
+    });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    assert.strictEqual(r.json.adopted, 3);
+    dsv = (await call(base, 'GET', `/documents/${ds}`)).json;
+    assert.strictEqual(dsv.document.version, afterGroupVer + 1, '整批只推进一次版本');
+    // 乙本三组片段均已写入，且文字与底本一致（无异文），未选组不存在（三组全选）
+    for (const g of dsv.groups) {
+      const cell = g.cells.find((c: any) => c.msId === sB.id);
+      assert.ok(cell && !cell.missing && cell.startCp != null, `第 ${g.ord} 组乙本应已补配`);
+      assert.strictEqual(cell.text, g.baseText);
+      assert.strictEqual(cell.broken, false);
+    }
+    // 丙本组2缺文等已有片段原样保留
+    const g2c = dsv.groups.find((g: any) => g.ord === 2).cells.find((c: any) => c.msId === sC.id);
+    assert.strictEqual(g2c.missing, true);
+    // 再次预览：乙本已无参与组
+    pv = (await call(base, 'GET', `/documents/${ds}/supply-preview?msId=${sB.id}`)).json;
+    assert.strictEqual(pv.eligibleGroupCount, 0);
+    // 对丙本：组1已有片段，组2/3已标缺文 → 同样无参与组
+    pv = (await call(base, 'GET', `/documents/${ds}/supply-preview?msId=${sC.id}`)).json;
+    assert.strictEqual(pv.eligibleGroupCount, 0);
+
+    // ---------- 补配：无候选 / 占用排除 / 区间冲突 / 失效拒绝 / 过期 409 ----------
+    r = await call(base, 'POST', '/documents', { title: `补配边界测试 ${++seq}`, manuscripts: ['甲', '乙'] });
+    assert.strictEqual(r.status, 201);
+    const de = r.json.id;
+    let dev = (await call(base, 'GET', `/documents/${de}`)).json;
+    let dever = dev.document.version;
+    const [eA, eB] = dev.manuscripts;
+    // 甲行1 甲乙丙丁；乙行1 〇甲乙甲丁
+    await call(base, 'POST', `/manuscripts/${eA.id}/lines`, { expectedVersion: dever++, content: '甲乙丙丁' });
+    await call(base, 'POST', `/manuscripts/${eB.id}/lines`, { expectedVersion: dever++, content: '〇甲乙甲丁' });
+    dev = (await call(base, 'GET', `/documents/${de}`)).json;
+    const ea1 = dev.rawByMs.find((x: any) => x.msId === eA.id).lines[0].lineId;
+    const eb1 = dev.rawByMs.find((x: any) => x.msId === eB.id).lines[0].lineId;
+    // 两组底本文字：组1「甲」[0,1)、组2「丁」[3,4)。乙本对两组均缺席。
+    r = await call(base, 'PUT', `/documents/${de}/groups`, {
+      expectedVersion: dev.document.version,
+      groups: [
+        { ord: 1, fragments: [{ msId: eA.id, lineId: ea1, startCp: 0, endCp: 1 }] },
+        { ord: 2, fragments: [{ msId: eA.id, lineId: ea1, startCp: 3, endCp: 4 }] },
+      ],
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    dev = (await call(base, 'GET', `/documents/${de}`)).json;
+    const egVer = dev.document.version;
+    pv = (await call(base, 'GET', `/documents/${de}/supply-preview?msId=${eB.id}`)).json;
+    // 组1「甲」：乙行有 [1,2) 与 [3,4) 两处 → 多候选
+    const p1 = pv.groups.find((x: any) => x.ord === 1);
+    assert.strictEqual(p1.reason, 'multiple-candidates');
+    assert.strictEqual(p1.candidates.length, 2);
+    // 组2「丁」：乙行 [4,5) 唯一 → 可采纳
+    const p2 = pv.groups.find((x: any) => x.ord === 2);
+    assert.strictEqual(p2.adoptable, true);
+    assert.deepStrictEqual(
+      { lineNo: p2.candidates[0].lineNo, s: p2.candidates[0].startCp, e: p2.candidates[0].endCp },
+      { lineNo: 1, s: 4, e: 5 }
+    );
+
+    // 组间候选冲突场景：两组底本文字重叠时（新建文献）
+    r = await call(base, 'POST', '/documents', { title: `补配冲突测试 ${++seq}`, manuscripts: ['甲', '乙'] });
+    assert.strictEqual(r.status, 201);
+    const dc = r.json.id;
+    let dcv = (await call(base, 'GET', `/documents/${dc}`)).json;
+    let dcver = dcv.document.version;
+    const [cA, cB] = dcv.manuscripts;
+    // 甲行1 天命之命（组1「天命之」[0,3)、组2「命之命」[2,5) 底本侧相接不重叠？[0,3)与[2,5) 重叠——不允许）
+    // 取底本侧可同组共存：组1「天命之」[0,3)，组2需要另一行
+    await call(base, 'POST', `/manuscripts/${cA.id}/lines`, { expectedVersion: dcver++, content: '天命之' });
+    await call(base, 'POST', `/manuscripts/${cA.id}/lines`, { expectedVersion: dcver++, content: '命之x' });
+    // 乙行1 天命之命：组1底本「天命之」[0,3) 命中 [0,3)；组2底本「命之x」无完全相同
+    // 为制造重叠：让两组底本文字在乙同一处都能命中——甲行2改为「命之」？需与组1文字重叠命中：
+    // 组2 底本文字取「命之」，乙行「天命之」中「命之」位于 [1,3)，与组1候选 [0,3) 重叠
+    await call(base, 'POST', `/manuscripts/${cB.id}/lines`, { expectedVersion: dcver++, content: '天命之' });
+    dcv = (await call(base, 'GET', `/documents/${dc}`)).json;
+    const ca1 = dcv.rawByMs.find((x: any) => x.msId === cA.id).lines.find((l: any) => l.lineNo === 1).lineId;
+    const ca2 = dcv.rawByMs.find((x: any) => x.msId === cA.id).lines.find((l: any) => l.lineNo === 2).lineId;
+    const cb1 = dcv.rawByMs.find((x: any) => x.msId === cB.id).lines[0].lineId;
+    r = await call(base, 'PUT', `/documents/${dc}/groups`, {
+      expectedVersion: dcv.document.version,
+      groups: [
+        { ord: 1, fragments: [{ msId: cA.id, lineId: ca1, startCp: 0, endCp: 3 }] }, // 天命之
+        { ord: 2, fragments: [{ msId: cA.id, lineId: ca2, startCp: 0, endCp: 2 }] }, // 命之
+      ],
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    dcv = (await call(base, 'GET', `/documents/${dc}`)).json;
+    const dcVerAfterGroups = dcv.document.version;
+    pv = (await call(base, 'GET', `/documents/${dc}/supply-preview?msId=${cB.id}`)).json;
+    const q1 = pv.groups.find((x: any) => x.ord === 1); // 天命之 → [0,3)
+    const q2 = pv.groups.find((x: any) => x.ord === 2); // 命之 → [1,3)
+    assert.strictEqual(q1.candidates.length, 1);
+    assert.strictEqual(q2.candidates.length, 1);
+    assert.strictEqual(q1.adoptable, false, '与组2候选重叠，不可直接采纳');
+    assert.strictEqual(q2.adoptable, false);
+    assert.strictEqual(q1.reason, 'candidate-conflict');
+    assert.strictEqual(q2.reason, 'candidate-conflict');
+    assert.strictEqual(q1.candidates[0].conflictsWith.length, 1);
+    assert.strictEqual(q1.candidates[0].conflictsWith[0].groupId, q2.groupId);
+
+    // 同时提交两个重叠候选 → 409 候选失效，整批不写入、不推进版本
+    r = await call(base, 'POST', `/documents/${dc}/supply`, {
+      expectedVersion: dcVerAfterGroups,
+      msId: cB.id,
+      selections: [
+        { groupId: q1.groupId, lineId: cb1, startCp: 0, endCp: 3 },
+        { groupId: q2.groupId, lineId: cb1, startCp: 1, endCp: 3 },
+      ],
+    });
+    await expectFail(r, 409, '重叠');
+    assert.strictEqual((await call(base, 'GET', `/documents/${dc}`)).json.document.version, dcVerAfterGroups,
+      '候选失效时不推进版本');
+    // 只选其一 → 成功（跳过的组保留缺席）
+    r = await call(base, 'POST', `/documents/${dc}/supply`, {
+      expectedVersion: dcVerAfterGroups,
+      msId: cB.id,
+      selections: [{ groupId: q1.groupId, lineId: cb1, startCp: 0, endCp: 3 }],
+    });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    assert.strictEqual(r.json.adopted, 1);
+    dcv = (await call(base, 'GET', `/documents/${dc}`)).json;
+    assert.strictEqual(dcv.document.version, dcVerAfterGroups + 1);
+    const afterSupplyVer = dcv.document.version;
+    const dg1 = dcv.groups.find((g: any) => g.ord === 1);
+    const dg2 = dcv.groups.find((g: any) => g.ord === 2);
+    assert.ok(dg1.cells.find((c: any) => c.msId === cB.id).startCp === 0);
+    assert.strictEqual(dg2.cells.find((c: any) => c.msId === cB.id).text, undefined, '未选组保持无片段');
+
+    // 候选失效：乙原文把 [1,3) 改掉后，旧预览里的组2候选「命之」[1,3) 不再等于底本文字 → 409 拒绝
+    r = await call(base, 'PUT', `/lines/${cb1}`, {
+      expectedVersion: afterSupplyVer, startCp: 1, endCp: 3, replacement: 'xx',
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    dcv = (await call(base, 'GET', `/documents/${dc}`)).json;
+    // 该改字与组1乙片段 [0,3) 相交 → 组1待修复（不参与补配）；用组2的失效候选提交
+    assert.ok(dcv.groups.find((g: any) => g.ord === 1).broken);
+    r = await call(base, 'POST', `/documents/${dc}/supply`, {
+      expectedVersion: dcv.document.version,
+      msId: cB.id,
+      selections: [{ groupId: q2.groupId, lineId: cb1, startCp: 1, endCp: 3 }],
+    });
+    await expectFail(r, 409, '候选');
+
+    // 版本过期：基于旧版本提交 → 409 版本已过期
+    r = await call(base, 'POST', `/documents/${dc}/supply`, {
+      expectedVersion: afterSupplyVer - 1,
+      msId: cB.id,
+      selections: [],
+    });
+    await expectFail(r, 409, '版本已过期');
+
+    // 占用排除（blockedByExisting）与无候选、待修复不参与：另建文献
+    r = await call(base, 'POST', '/documents', { title: `补配占用测试 ${++seq}`, manuscripts: ['甲', '乙'] });
+    assert.strictEqual(r.status, 201);
+    const df = r.json.id;
+    let dfv = (await call(base, 'GET', `/documents/${df}`)).json;
+    let dfver = dfv.document.version;
+    const [fA, fB] = dfv.manuscripts;
+    // 甲行1「甲乙丙丁丁」：组1「丁」[3,4)，组2「丁」[4,5)（底本侧端点相接，允许）
+    // 乙行1「〇甲乙丁」：「丁」仅出现一次 [4,5)，归组时即补在组1；组2在乙本缺席
+    await call(base, 'POST', `/manuscripts/${fA.id}/lines`, { expectedVersion: dfver++, content: '甲乙丙丁丁' });
+    await call(base, 'POST', `/manuscripts/${fB.id}/lines`, { expectedVersion: dfver++, content: '〇甲乙丁' });
+    dfv = (await call(base, 'GET', `/documents/${df}`)).json;
+    const fa1 = dfv.rawByMs.find((x: any) => x.msId === fA.id).lines[0].lineId;
+    const fb1 = dfv.rawByMs.find((x: any) => x.msId === fB.id).lines[0].lineId;
+    r = await call(base, 'PUT', `/documents/${df}/groups`, {
+      expectedVersion: dfv.document.version,
+      groups: [
+        { ord: 1, fragments: [
+          { msId: fA.id, lineId: fa1, startCp: 3, endCp: 4 },
+          { msId: fB.id, lineId: fb1, startCp: 3, endCp: 4 },
+        ]},
+        { ord: 2, fragments: [
+          { msId: fA.id, lineId: fa1, startCp: 4, endCp: 5 },
+        ]},
+      ],
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    pv = (await call(base, 'GET', `/documents/${df}/supply-preview?msId=${fB.id}`)).json;
+    assert.strictEqual(pv.eligibleGroupCount, 1, '组1在乙已有片段，仅组2参与');
+    const pf2 = pv.groups[0];
+    assert.strictEqual(pf2.ord, 2);
+    assert.strictEqual(pf2.reason, 'no-candidate');
+    assert.strictEqual(pf2.candidates.length, 0);
+    assert.ok(pf2.blockedByExisting >= 1, '唯一出现处被组1乙片段占用');
+    // 空 selections → 400（请求格式问题）
+    r = await call(base, 'POST', `/documents/${df}/supply`, { expectedVersion: pv.version, msId: fB.id, selections: [] });
+    await expectFail(r, 400, 'selections');
+
+    // 待修复组不参与：把甲行缩短到 2 字 → 两组底本片段均越界待修复，预览为空
+    dfv = (await call(base, 'GET', `/documents/${df}`)).json;
+    r = await call(base, 'PUT', `/lines/${fa1}`, {
+      expectedVersion: dfv.document.version, startCp: 2, endCp: 5, replacement: '',
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    pv = (await call(base, 'GET', `/documents/${df}/supply-preview?msId=${fB.id}`)).json;
+    assert.strictEqual(pv.eligibleGroupCount, 0, '待修复组不参与补配');
+    // 对一个待修复组提交候选 → 409 拒绝（即使用户持旧预览）
+    dfv = (await call(base, 'GET', `/documents/${df}`)).json;
+    const brokenG2 = dfv.groups.find((g: any) => g.ord === 2).id;
+    r = await call(base, 'POST', `/documents/${df}/supply`, {
+      expectedVersion: dfv.document.version, msId: fB.id,
+      selections: [{ groupId: brokenG2, lineId: fb1, startCp: 3, endCp: 4 }],
+    });
+    await expectFail(r, 409, '待修复');
+
+    // 生僻字（扩展区）按 Unicode 码点计：新建文献验证
+    r = await call(base, 'POST', '/documents', { title: `补配码点测试 ${++seq}`, manuscripts: ['甲', '乙'] });
+    assert.strictEqual(r.status, 201);
+    const du = r.json.id;
+    let duv = (await call(base, 'GET', `/documents/${du}`)).json;
+    let duver = duv.document.version;
+    const [uA, uB] = duv.manuscripts;
+    // 𰻞 = U+30FDE（扩展G区，代理对）；甲行「x𰻞y」，乙行「z𰻞z」，组底本片段「𰻞」[1,2)
+    await call(base, 'POST', `/manuscripts/${uA.id}/lines`, { expectedVersion: duver++, content: 'x𰻞y' });
+    await call(base, 'POST', `/manuscripts/${uB.id}/lines`, { expectedVersion: duver++, content: 'z𰻞z' });
+    duv = (await call(base, 'GET', `/documents/${du}`)).json;
+    const ua1 = duv.rawByMs.find((x: any) => x.msId === uA.id).lines[0].lineId;
+    const ub1 = duv.rawByMs.find((x: any) => x.msId === uB.id).lines[0].lineId;
+    r = await call(base, 'PUT', `/documents/${du}/groups`, {
+      expectedVersion: duv.document.version,
+      groups: [{ ord: 1, fragments: [{ msId: uA.id, lineId: ua1, startCp: 1, endCp: 2 }] }],
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    duv = (await call(base, 'GET', `/documents/${du}`)).json;
+    pv = (await call(base, 'GET', `/documents/${du}/supply-preview?msId=${uB.id}`)).json;
+    assert.strictEqual(pv.groups.length, 1);
+    assert.strictEqual(pv.groups[0].adoptable, true);
+    assert.deepStrictEqual(
+      { s: pv.groups[0].candidates[0].startCp, e: pv.groups[0].candidates[0].endCp, t: pv.groups[0].candidates[0].text },
+      { s: 1, e: 2, t: '𰻞' }
+    );
+    r = await call(base, 'POST', `/documents/${du}/supply`, {
+      expectedVersion: pv.version, msId: uB.id,
+      selections: [{ groupId: pv.groups[0].groupId, lineId: ub1, startCp: 1, endCp: 2 }],
+    });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    duv = (await call(base, 'GET', `/documents/${du}`)).json;
+    assert.strictEqual(duv.groups[0].cells.find((c: any) => c.msId === uB.id).text, '𰻞');
+
     console.log('✅ 全部集成测试通过');
   } finally {
     await close();

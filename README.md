@@ -138,6 +138,47 @@ npm run dev          # http://localhost:5173 （/api 自动代理到 4000）
   `groupDiff.unpairedOld / unpairedNew`（未配对旧/新组及原因）。
 
 
+### 自动补配（按底本文字在目标抄本行文中预配片段）
+- 在工作区“自动补配”页签选择**目标抄本**（不能是底本）后，系统按**完好对应组**的底本文字，
+  在该抄本**原始行文**中预览补配候选；**待修复组不参与**。
+- 参与范围：仅该抄本**尚无片段且未标缺文**的完好组。候选须为某**单行内**与底本文字
+  按 **Unicode 码点完整相同**的连续字句，且区间**不占用任何现有片段**（端点相接允许）；
+  返回行号与 `[startCp, endCp)` 码点区间。
+- 每组显示：**无候选**、**多处候选**（需人工择一）、或唯一候选**与其他组候选区间重叠**的原因；
+  仅**唯一且无冲突**的候选标记为“可直接采纳”（默认勾选，可取消），其余由人选一个或跳过。
+  行文中以颜色高亮全部候选（绿=可采纳，黄=多候选，红=区间冲突），点击高亮即可选中。
+- 提交时连同**预览时的文献版本号**一并送服务端，在当前工作版（行锁 + SERIALIZABLE）内
+  **重新核对整批**：组仍完好且仍参与、底本文字未变、候选行归属与区间合法、文字仍逐码点相同、
+  不与现有片段重叠、所选候选彼此不重叠，再跑一遍完整归组校验——**整批通过才写入**；
+  **未选组与已有片段原样保留**，成功后文献版本**只推进一次**。
+- `expectedVersion` 过期 → **409 版本已过期**；候选在当前工作版已失效 → **409（CANDIDATE_STALE）拒绝整批、不推进版本**。
+- 接口：
+  - 预览（只读，不推进版本）：`GET /api/documents/:id/supply-preview?msId=<目标抄本id>`
+  - 提交：`POST /api/documents/:id/supply`，请求/响应示例：
+
+    ```bash
+    # 预览
+    curl 'http://localhost:4000/api/documents/1/supply-preview?msId=2'
+    # 返回（节选）：version=预览版本号；groups[].candidates[] 含 lineId/lineNo/startCp/endCp/text，
+    # adoptable=true 即唯一无冲突；reason: no-candidate | multiple-candidates | candidate-conflict
+
+    # 提交所选候选（每组至多一个；expectedVersion 取预览返回的 version）
+    curl -X POST http://localhost:4000/api/documents/1/supply \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "expectedVersion": 4,
+        "msId": 2,
+        "selections": [
+          { "groupId": 1, "lineId": 2, "startCp": 1, "endCp": 6 },
+          { "groupId": 2, "lineId": 2, "startCp": 6, "endCp": 11 }
+        ]
+      }'
+    # 201 -> {"ok":true,"adopted":2,"groupIds":[1,2]}
+    # 409（版本过期）-> {"error":"版本已过期：您基于版本 4 修改，当前版本为 5 …","details":{"currentVersion":5}}
+    # 409（候选失效）-> {"error":"第 2 组候选文字「…」与当前底本文字「…」不再完全相同，候选失效",
+    #                    "details":{"code":"CANDIDATE_STALE","groupOrd":2}}
+    ```
+
 ### 并发控制
 - 所有写请求必须携带 `expectedVersion`（乐观锁）；
 - 基于过期版本的修改返回 **409 拒绝**，不做任何写入，前端提示刷新后重试；
@@ -162,6 +203,8 @@ npm run dev          # http://localhost:5173 （/api 自动代理到 4000）
 | POST | `/api/documents/:id/publish` | 发布新版（有待修复组则 409） |
 | GET | `/api/documents/:id/editions` / `…/editions/:no` | 版本列表 / 阅读旧版快照 |
 | GET | `/api/documents/:id/editions/:no/diff` | **该已发布版与当前工作版的版本对照**（旧版不存在 → 404） |
+| GET | `/api/documents/:id/supply-preview?msId=` | **补配候选预览**（只读；完好组底本文字在目标抄本行文中的空闲单行相同文字） |
+| POST | `/api/documents/:id/supply` | **整批提交补配选择**（带预览版本号重新核对；过期 409、候选失效 409 拒绝整批） |
 
 写请求体均含 `expectedVersion`；错误响应：`{ "error": "...", "details": [ { "code", "message", "groupOrd", "msName", "lineNo", ... } ] }`。
 
@@ -181,7 +224,10 @@ npm test
 修复流程、发布门禁、旧版快照可读、切换底本，以及
 **版本对照：行文增删改（按原始行号）、整批重存换组 ID 仍按底本位置唯一配对、
 无法配对组分别列出且不推断移动、底本不同不配对、缺文标记变化、待修复组显式标识且越界文字不作确定文字、
-旧版不存在 404、对照只读且刷新反映最新工作版**。
+旧版不存在 404、对照只读且刷新反映最新工作版，以及
+**自动补配：唯一空闲候选可采纳、多处/无候选/被现有片段占用/组间候选重叠的原因、
+码点级区间（扩展区生僻字）、整批提交只推进一次版本、未选组与已有片段保留、
+版本过期 409、候选失效（文字变化/越界/组已待修复）409 拒绝整批且不推进版本、待修复组不参与**。
 
 ---
 

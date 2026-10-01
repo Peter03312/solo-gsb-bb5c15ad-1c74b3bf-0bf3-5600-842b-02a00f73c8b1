@@ -80,6 +80,44 @@ export interface EditionSummary {
   created_at: string;
 }
 
+// ---- 自动补配 ----
+
+export type SupplyReason = 'no-candidate' | 'multiple-candidates' | 'candidate-conflict';
+
+export interface SupplyCandidate {
+  lineId: number;
+  lineNo: number;
+  startCp: number;
+  endCp: number;
+  text: string;
+  conflictsWith: Array<{ groupId: number; ord: number; lineId: number; startCp: number; endCp: number }>;
+}
+
+export interface SupplyGroup {
+  groupId: number;
+  ord: number;
+  baseText: string;
+  adoptable: boolean;
+  reason: SupplyReason | null;
+  reasonText: string | null;
+  candidates: SupplyCandidate[];
+  blockedByExisting: number;
+}
+
+export interface SupplyPreview {
+  documentId: number;
+  title: string;
+  version: number;
+  targetMsId: number;
+  targetMsName: string;
+  baseMsId: number | null;
+  baseMsName: string | null;
+  generatedAt: string;
+  eligibleGroupCount: number;
+  adoptableCount: number;
+  groups: SupplyGroup[];
+}
+
 // ---- 版本对照（已发布校勘版 vs 当前工作版）----
 
 export interface DiffSideInfo {

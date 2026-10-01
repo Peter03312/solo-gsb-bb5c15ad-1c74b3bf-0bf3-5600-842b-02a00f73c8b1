@@ -204,3 +204,22 @@ input:focus, textarea:focus { outline: 2px solid #d9c9a8; }
 .unpaired-cells { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 2px 14px; }
 .unpaired-cell { font-size: 14px; }
 .unpaired-cell .msname { display: inline-block; min-width: 70px; font-weight: 600; }
+
+/* ---- 自动补配 ---- */
+.draft-card.supply-warn { border-color: #d9b382; }
+.supply-cand-list { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.supply-cand {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 3px 8px; border: 1px solid var(--line); border-radius: 4px; background: #fff;
+  cursor: pointer; font-size: 14px;
+}
+.supply-cand.selected { border-color: var(--ok); background: #eef5ec; }
+.supply-adopt-bg { background: #cfe7c9; }
+.supply-multi-bg { background: #f6e3ae; }
+.supply-conflict-bg { background: #f1c5c0; }
+.line-text .ch.supply-adopt { background: #bfe0b6; outline: 1px solid #8fbf86; }
+.line-text .ch.supply-multi { background: #f1d69a; outline: 1px solid #d8b65e; }
+.line-text .ch.supply-conflict { background: #ebb4ad; outline: 1px solid #cf7f76; }
+.legend span.supply-adopt-bg,
+.legend span.supply-multi-bg,
+.legend span.supply-conflict-bg { border: 1px solid rgba(0,0,0,.12); }

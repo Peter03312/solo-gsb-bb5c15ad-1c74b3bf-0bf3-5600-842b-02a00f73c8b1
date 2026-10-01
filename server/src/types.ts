@@ -114,6 +114,56 @@ export interface CollationView {
   };
 }
 
+// ---- 自动补配（按完好对应组的底本文字，在目标抄本原始行文中预览候选）----
+
+/**
+ * 组不能直接采纳的原因：
+ *  no-candidate       空闲区间中无任何与底本文字完全相同的单行文段；
+ *  multiple-candidates存在两处及以上空闲命中（需人工择一）；
+ *  candidate-conflict 唯一空闲候选与其他组的候选区间重叠。
+ */
+export type SupplyReason = 'no-candidate' | 'multiple-candidates' | 'candidate-conflict';
+
+export interface SupplyCandidate {
+  lineId: number;
+  lineNo: number;
+  startCp: number;               // Unicode 码点偏移（左闭）
+  endCp: number;                 // Unicode 码点偏移（右开）
+  text: string;                  // 命中文字（与底本文字逐码点相同）
+  /** 与哪些其他组的候选区间重叠（组候选之间冲突，双方均标记）。 */
+  conflictsWith: Array<{ groupId: number; ord: number; lineId: number; startCp: number; endCp: number }>;
+}
+
+export interface SupplyGroupDTO {
+  groupId: number;
+  ord: number;
+  baseText: string;
+  /** 可直接采纳：唯一空闲候选且不与任何其他组候选重叠。 */
+  adoptable: boolean;
+  /** adoptable=false 时的原因；adoptable=true 时为 null。 */
+  reason: SupplyReason | null;
+  reasonText: string | null;
+  candidates: SupplyCandidate[];
+  /** 被现有片段区间占用而排除的命中出现次数（仅供说明）。 */
+  blockedByExisting: number;
+}
+
+export interface SupplyPreview {
+  documentId: number;
+  title: string;
+  /** 预览所依据的当前工作版版本号；提交时须原样带回。 */
+  version: number;
+  targetMsId: number;
+  targetMsName: string;
+  baseMsId: number | null;
+  baseMsName: string | null;
+  generatedAt: string;
+  /** 参与补配的组数（完好、且目标抄本尚无片段也未标缺文）。 */
+  eligibleGroupCount: number;
+  adoptableCount: number;
+  groups: SupplyGroupDTO[];
+}
+
 // ---- 版本对照（任一已发布校勘版 vs 当前工作版）----
 
 export interface DiffSideInfo {
